@@ -39,10 +39,3 @@ Currently in development.
 
 The initial goal is to build a stable modular flight computer by integrating each hardware component individually before combining the complete system.
 
----
-
-# Author
-
-Your Name
-
-Embedded Systems | Robotics | STM32 Development
