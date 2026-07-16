@@ -1,9 +1,9 @@
 
 ---
 
-# Future Enhancements
+# WORK IN PROGRESS
 
-Planned improvements:
+Plan :
 
 - Magnetometer based yaw estimation
 - PID controller implementation
