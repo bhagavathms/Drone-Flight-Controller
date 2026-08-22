@@ -1,87 +1,96 @@
-﻿import time
+"""
+flight_sim.py
+=============================================================================
+Drone Flight Computer -- Software-in-the-Loop (SITL) Python Harness
+
+Architecture:
+    [VirtualSensors]  -->  [SITLBridge / C .dll]  -->  [Dashboard]
+      Python layer          Embedded C layer            Python layer
+
+Responsibilities of each layer:
+  - VirtualSensors : Generates fake but physically plausible IMU and battery
+                     data (accelerometer, gyroscope, voltage). Replaces real
+                     MPU-6050 hardware in the SITL loop.
+  - SITLBridge     : Loads flight_controller.dll (compiled from flight_controller.c)
+                     via ctypes and calls the C functions fc_update() and
+                     fc_motor_mixing(). ALL flight logic runs in C.
+  - main() / Dashboard : Reads from both layers, prints a live terminal
+                         dashboard refreshed at ~10 Hz.
+
+To rebuild the C library:
+    Windows : build.bat
+    Linux   : gcc -shared -fPIC -o flight_controller.so flight_controller.c -lm
+=============================================================================
+"""
+
+import time
 import math
 import os
 import random
 import sys
-
-# Ensure UTF-8 output on Windows terminals (PowerShell / cmd)
-if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except AttributeError:
-        pass
-
+import ctypes
+import ctypes.util
 
 # =============================================================================
-# VIRTUAL SENSORS -- Software-in-the-Loop hardware abstraction layer
+# VIRTUAL SENSORS -- Python SITL hardware abstraction layer
 # =============================================================================
 
 class VirtualSensors:
     """
-    Software-in-the-Loop (SITL) virtual sensor suite for drone flight computer simulation.
-    Simulates IMU (MPU-6050) and battery readings without physical hardware.
+    Software-in-the-Loop virtual sensor suite.
+    Simulates MPU-6050 IMU and 3S LiPo battery without physical hardware.
     """
 
     def __init__(self):
-        """Initialize the virtual sensor suite and record the simulation start time."""
+        """Record simulation start time."""
         self.start_time = time.time()
 
     def read_mpu6050(self):
         """
-        Simulate MPU-6050 IMU sensor readings.
+        Generate slowly oscillating IMU readings using sin/cos on elapsed time.
 
-        Uses elapsed time with sin/cos functions to generate slowly oscillating
-        fake accelerometer and gyroscope data, mimicking a drone hovering with
-        slight vibrations and attitude perturbations.
+        Simulates a hovering drone with slight attitude perturbations and sensor
+        noise. Z-axis gravity is kept near 1.0 g.
 
         Returns:
-            dict: Keys: accel_x, accel_y, accel_z (g), gyro_x, gyro_y, gyro_z (deg/s)
+            dict: accel_x/y/z (g), gyro_x/y/z (deg/s)
         """
         elapsed = time.time() - self.start_time
 
-        # Slowly oscillating accelerometer values simulating gentle attitude sway
-        accel_x = 0.05 * math.sin(0.3 * elapsed) + random.uniform(-0.005, 0.005)
+        accel_x = 0.05 * math.sin(0.3 * elapsed)  + random.uniform(-0.005, 0.005)
         accel_y = 0.05 * math.cos(0.25 * elapsed) + random.uniform(-0.005, 0.005)
+        accel_z = 1.0  + 0.02 * math.sin(0.1 * elapsed) + random.uniform(-0.003, 0.003)
 
-        # Z-axis keeps gravity near 1.0 g with minor oscillation
-        accel_z = 1.0 + 0.02 * math.sin(0.1 * elapsed) + random.uniform(-0.003, 0.003)
-
-        # Slowly oscillating gyroscope values simulating minor rotational drift
-        gyro_x = 1.5 * math.sin(0.2 * elapsed) + random.uniform(-0.1, 0.1)
-        gyro_y = 1.5 * math.cos(0.15 * elapsed) + random.uniform(-0.1, 0.1)
-        gyro_z = 0.8 * math.sin(0.05 * elapsed) + random.uniform(-0.05, 0.05)
+        gyro_x  = 1.5 * math.sin(0.2 * elapsed)  + random.uniform(-0.1,  0.1)
+        gyro_y  = 1.5 * math.cos(0.15 * elapsed) + random.uniform(-0.1,  0.1)
+        gyro_z  = 0.8 * math.sin(0.05 * elapsed) + random.uniform(-0.05, 0.05)
 
         return {
             "accel_x": round(accel_x, 4),
             "accel_y": round(accel_y, 4),
             "accel_z": round(accel_z, 4),
-            "gyro_x":  round(gyro_x, 4),
-            "gyro_y":  round(gyro_y, 4),
-            "gyro_z":  round(gyro_z, 4),
+            "gyro_x":  round(gyro_x,  4),
+            "gyro_y":  round(gyro_y,  4),
+            "gyro_z":  round(gyro_z,  4),
         }
 
     def read_battery(self):
         """
-        Simulate LiPo battery voltage degradation over time.
+        Simulate 3S LiPo voltage degradation over time.
 
-        Voltage starts at a fully-charged 12.6V (3S LiPo) and slowly degrades
-        based on elapsed simulation time, never dropping below the safe minimum
-        of 10.5V (3.5V per cell).
+        Starts at 12.6V (fully charged), degrades at 0.002 V/s,
+        never drops below 10.5V (safe minimum 3.5V/cell).
 
         Returns:
-            dict: Keys: voltage (V), elapsed (s), percent (%)
+            dict: voltage (V), elapsed (s), percent (%)
         """
-        MAX_VOLTAGE    = 12.6    # Fully charged 3S LiPo (4.2V/cell)
-        MIN_VOLTAGE    = 10.5    # Safe minimum 3S LiPo  (3.5V/cell)
-        DISCHARGE_RATE = 0.002   # Volts per second of simulated discharge
+        MAX_V  = 12.6
+        MIN_V  = 10.5
+        RATE   = 0.002   # V/s
 
         elapsed = time.time() - self.start_time
-
-        # Linear discharge model clamped to minimum safe voltage
-        voltage = max(MIN_VOLTAGE, MAX_VOLTAGE - DISCHARGE_RATE * elapsed)
-
-        voltage_range = MAX_VOLTAGE - MIN_VOLTAGE
-        percent = ((voltage - MIN_VOLTAGE) / voltage_range) * 100.0
+        voltage = max(MIN_V, MAX_V - RATE * elapsed)
+        percent = ((voltage - MIN_V) / (MAX_V - MIN_V)) * 100.0
 
         return {
             "voltage": round(voltage, 3),
@@ -91,205 +100,233 @@ class VirtualSensors:
 
 
 # =============================================================================
-# FLIGHT CONTROLLER -- Sensor fusion, attitude estimation, motor mixing
+# SITL BRIDGE -- ctypes interface to the Embedded C flight controller
 # =============================================================================
 
-class FlightController:
+class _IMUData(ctypes.Structure):
     """
-    Software-in-the-Loop Flight Controller.
-
-    Implements:
-      - Accelerometer-based roll/pitch estimation via atan2
-      - Complementary filter for sensor fusion (gyro + accel)
-      - Standard quadcopter motor-mixing algorithm
-      - PWM output clamped to [1000, 2000] µs (ESC range)
-
-    Motor layout (top-down view):
-        M1 (Front-Left)  CW    M2 (Front-Right) CCW
-        M3 (Rear-Left)  CCW    M4 (Rear-Right)   CW
+    Mirror of the C IMUData struct (flight_controller.h).
+    Field order and types MUST match exactly.
     """
+    _fields_ = [
+        ("accel_x", ctypes.c_float),
+        ("accel_y", ctypes.c_float),
+        ("accel_z", ctypes.c_float),
+        ("gyro_x",  ctypes.c_float),
+        ("gyro_y",  ctypes.c_float),
+        ("gyro_z",  ctypes.c_float),
+    ]
 
-    # Complementary filter coefficient (gyro trust weight)
-    ALPHA = 0.96
 
-    # ESC PWM limits (µs)
-    PWM_MIN = 1000
-    PWM_MAX = 2000
+class _AttitudeOutput(ctypes.Structure):
+    """Mirror of the C AttitudeOutput struct."""
+    _fields_ = [
+        ("roll",  ctypes.c_float),
+        ("pitch", ctypes.c_float),
+    ]
 
-    # Base throttle for a hovering quadcopter (mid-range)
-    BASE_THROTTLE = 1500
+
+class _MotorOutput(ctypes.Structure):
+    """Mirror of the C MotorOutput struct."""
+    _fields_ = [
+        ("m1", ctypes.c_int),
+        ("m2", ctypes.c_int),
+        ("m3", ctypes.c_int),
+        ("m4", ctypes.c_int),
+    ]
+
+
+class SITLBridge:
+    """
+    Python-to-C bridge for the embedded flight controller.
+
+    Loads flight_controller.dll (Windows) or flight_controller.so (Linux/Mac)
+    from the same directory as this script and exposes a clean Python API.
+
+    All actual flight math runs inside the compiled C code.
+    """
 
     def __init__(self):
-        """Initialise attitude state and timing."""
-        self.roll  = 0.0   # Estimated roll  angle (degrees)
-        self.pitch = 0.0   # Estimated pitch angle (degrees)
-        self.last_time = time.time()
+        """Load the shared library and configure function signatures."""
+        # Resolve library path relative to this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # ------------------------------------------------------------------
-    # Attitude estimation
-    # ------------------------------------------------------------------
+        if sys.platform == "win32":
+            lib_name = "flight_controller.dll"
+        else:
+            lib_name = "flight_controller.so"
 
-    def update(self, imu: dict):
+        lib_path = os.path.join(script_dir, lib_name)
+
+        if not os.path.exists(lib_path):
+            raise FileNotFoundError(
+                f"[SITLBridge] Shared library not found: {lib_path}\n"
+                f"             Run build.bat (Windows) or make (Linux) first."
+            )
+
+        self._lib = ctypes.CDLL(lib_path)
+        self._configure_signatures()
+        self._lib.fc_init()
+
+        self._last_time = time.time()
+        print(f"[SITLBridge] Loaded {lib_name} -- C flight controller active.")
+
+    def _configure_signatures(self):
+        """Declare C function argument and return types for type safety."""
+        lib = self._lib
+
+        # void fc_init(void)
+        lib.fc_init.restype  = None
+        lib.fc_init.argtypes = []
+
+        # void fc_update(const IMUData*, float dt, AttitudeOutput*)
+        lib.fc_update.restype  = None
+        lib.fc_update.argtypes = [
+            ctypes.POINTER(_IMUData),
+            ctypes.c_float,
+            ctypes.POINTER(_AttitudeOutput),
+        ]
+
+        # void fc_motor_mixing(float roll, float pitch, MotorOutput*)
+        lib.fc_motor_mixing.restype  = None
+        lib.fc_motor_mixing.argtypes = [
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.POINTER(_MotorOutput),
+        ]
+
+    def process(self, imu_dict: dict) -> dict:
         """
-        Fuse accelerometer + gyroscope data with a Complementary Filter.
-
-        Step 1 – Accel angles: derive absolute roll/pitch from gravity vector.
-        Step 2 – Gyro integration: integrate angular velocity over dt.
-        Step 3 – Complementary filter: blend both estimates.
+        Send raw sensor data into the C flight controller and get back
+        fused attitude and motor PWM outputs.
 
         Args:
-            imu (dict): Output of VirtualSensors.read_mpu6050()
+            imu_dict (dict): Output from VirtualSensors.read_mpu6050()
 
         Returns:
-            tuple[float, float]: (roll_deg, pitch_deg) fused attitude estimate
+            dict:
+                - roll    (float): Fused roll  angle (degrees)
+                - pitch   (float): Fused pitch angle (degrees)
+                - pwm     (list[int]): [M1, M2, M3, M4] PWM values (us)
         """
+        # Compute dt
         now = time.time()
-        dt  = now - self.last_time
-        self.last_time = now
-
-        # Guard against zero or negative dt on the first call
+        dt  = now - self._last_time
+        self._last_time = now
         if dt <= 0:
             dt = 1e-3
 
-        ax = imu["accel_x"]
-        ay = imu["accel_y"]
-        az = imu["accel_z"]
-        gx = imu["gyro_x"]   # deg/s
-        gy = imu["gyro_y"]   # deg/s
+        # Populate C struct from Python dict
+        imu_c = _IMUData(
+            accel_x = imu_dict["accel_x"],
+            accel_y = imu_dict["accel_y"],
+            accel_z = imu_dict["accel_z"],
+            gyro_x  = imu_dict["gyro_x"],
+            gyro_y  = imu_dict["gyro_y"],
+            gyro_z  = imu_dict["gyro_z"],
+        )
 
-        # --- Step 1: Accelerometer-derived angles ---
-        # atan2 gives roll/pitch relative to the gravity vector (in radians → degrees)
-        accel_roll  = math.degrees(math.atan2(ay, az))
-        accel_pitch = math.degrees(math.atan2(-ax, math.sqrt(ay**2 + az**2)))
+        # Call C: sensor fusion -> attitude estimate
+        attitude = _AttitudeOutput()
+        self._lib.fc_update(
+            ctypes.byref(imu_c),
+            ctypes.c_float(dt),
+            ctypes.byref(attitude),
+        )
 
-        # --- Step 2 & 3: Complementary filter ---
-        # Gyro integration provides high-frequency accuracy; accel corrects drift.
-        self.roll  = self.ALPHA * (self.roll  + gx * dt) + (1 - self.ALPHA) * accel_roll
-        self.pitch = self.ALPHA * (self.pitch + gy * dt) + (1 - self.ALPHA) * accel_pitch
+        # Call C: motor mixing -> PWM outputs
+        motors = _MotorOutput()
+        self._lib.fc_motor_mixing(
+            ctypes.c_float(attitude.roll),
+            ctypes.c_float(attitude.pitch),
+            ctypes.byref(motors),
+        )
 
-        return round(self.roll, 4), round(self.pitch, 4)
-
-    # ------------------------------------------------------------------
-    # Motor mixing
-    # ------------------------------------------------------------------
-
-    def motor_mixing(self, roll: float, pitch: float) -> list[int]:
-        """
-        Convert roll/pitch attitude error into 4-motor PWM outputs.
-
-        Uses a standard quadcopter (+) mixing matrix:
-            M1 (FL) = throttle - roll + pitch
-            M2 (FR) = throttle + roll + pitch
-            M3 (RL) = throttle - roll - pitch
-            M4 (RR) = throttle + roll - pitch
-
-        A proportional gain scales the angle (degrees) into PWM µs correction.
-        Each output is clamped to [PWM_MIN, PWM_MAX].
-
-        Args:
-            roll  (float): Fused roll  angle in degrees
-            pitch (float): Fused pitch angle in degrees
-
-        Returns:
-            list[int]: [M1, M2, M3, M4] PWM values in µs
-        """
-        KP = 5.0   # Proportional gain: deg → µs correction
-
-        roll_cmd  = KP * roll
-        pitch_cmd = KP * pitch
-
-        m1 = self.BASE_THROTTLE - roll_cmd + pitch_cmd   # Front-Left
-        m2 = self.BASE_THROTTLE + roll_cmd + pitch_cmd   # Front-Right
-        m3 = self.BASE_THROTTLE - roll_cmd - pitch_cmd   # Rear-Left
-        m4 = self.BASE_THROTTLE + roll_cmd - pitch_cmd   # Rear-Right
-
-        # Clamp all outputs to valid ESC range
-        pwm = [int(max(self.PWM_MIN, min(self.PWM_MAX, m)))
-               for m in (m1, m2, m3, m4)]
-
-        return pwm
+        return {
+            "roll":  round(attitude.roll,  4),
+            "pitch": round(attitude.pitch, 4),
+            "pwm":   [motors.m1, motors.m2, motors.m3, motors.m4],
+        }
 
 
 # =============================================================================
-# HELPERS -- Bar rendering for dashboard
+# DASHBOARD HELPERS
 # =============================================================================
 
-def _bar(value: float, min_val: float, max_val: float, width: int = 20, char: str = "#") -> str:
-    """Render a simple ASCII progress bar."""
+def _bar(value: float, min_val: float, max_val: float, width: int = 20) -> str:
+    """Render a plain-ASCII progress bar."""
     ratio  = max(0.0, min(1.0, (value - min_val) / (max_val - min_val)))
     filled = int(ratio * width)
-    return char * filled + "." * (width - filled)
+    return "#" * filled + "." * (width - filled)
 
 
-def _pwm_bar(pwm: int, width: int = 15) -> str:
-    return _bar(pwm, 1000, 2000, width, "=")
+def _pwm_bar(pwm: int, width: int = 14) -> str:
+    return "=" * int((pwm - 1000) / 1000 * width) + "." * (width - int((pwm - 1000) / 1000 * width))
 
 
 # =============================================================================
-# MAIN LOOP -- Continuous SITL dashboard
+# MAIN LOOP -- SITL simulation dashboard
 # =============================================================================
 
 def main():
     """
-    Main Software-in-the-Loop simulation loop.
+    Main SITL loop.
 
-    Continuously:
-      1. Reads virtual IMU and battery sensors
-      2. Fuses sensor data through the complementary filter
-      3. Computes motor PWM outputs via the mixing algorithm
-      4. Renders a formatted live dashboard (refreshed via cls/clear)
-
-    Loop rate: ~10 Hz (0.1 s sleep)
+    1. VirtualSensors  ->  generates fake IMU + battery data  (Python)
+    2. SITLBridge      ->  passes IMU to C .dll, gets roll/pitch/PWM back
+    3. Dashboard       ->  prints formatted live view, refreshed every 0.1s
     """
     sensors = VirtualSensors()
-    fc      = FlightController()
+    bridge  = SITLBridge()
 
     cycle = 0
 
     while True:
         cycle += 1
 
-        # --- Read sensors ---
+        # --- Layer 1: Read virtual sensors (Python) ---
         imu = sensors.read_mpu6050()
         bat = sensors.read_battery()
 
-        # --- Update flight controller ---
-        roll, pitch = fc.update(imu)
-        pwm         = fc.motor_mixing(roll, pitch)
+        # --- Layer 2: Process in Embedded C via ctypes bridge ---
+        fc_out = bridge.process(imu)
 
-        # --- Clear terminal and render dashboard ---
+        roll  = fc_out["roll"]
+        pitch = fc_out["pitch"]
+        pwm   = fc_out["pwm"]
+
+        # --- Layer 3: Render dashboard (Python) ---
         os.system("cls" if os.name == "nt" else "clear")
 
-        batt_bar = _bar(bat["voltage"], 10.5, 12.6, 20)
-        batt_warn = "!! LOW BATTERY !!" if bat["percent"] < 20 else ""
-        W = 60  # dashboard width
+        W   = 62
         div = "+" + "-" * (W - 2) + "+"
 
         def row(text=""):
-            """Left-align text inside a fixed-width bordered row."""
             print(f"| {text:<{W - 3}}|")
+
+        batt_warn = "!! LOW BATT !!" if bat["percent"] < 20 else ""
 
         print(div)
         row(" DRONE FLIGHT COMPUTER  --  SITL DASHBOARD")
+        row(f" Cycle: {cycle:<6}  Elapsed: {bat['elapsed']:>7.2f}s   [C firmware active]")
         print(div)
-        row(f" Cycle : {cycle:<6}   Elapsed : {bat['elapsed']:>7.2f}s")
+        row(" [ INPUT: Virtual MPU-6050 Sensor Data (Python) ]")
+        row(f"  Accel  X:{imu['accel_x']:+7.4f}g   Y:{imu['accel_y']:+7.4f}g   Z:{imu['accel_z']:+7.4f}g")
+        row(f"  Gyro   X:{imu['gyro_x']:+7.4f}d/s  Y:{imu['gyro_y']:+7.4f}d/s  Z:{imu['gyro_z']:+7.4f}d/s")
         print(div)
-        row(" [ IMU -- MPU-6050 Raw ]")
-        row(f"  Accel  X:{imu['accel_x']:+7.4f}g  Y:{imu['accel_y']:+7.4f}g  Z:{imu['accel_z']:+7.4f}g")
-        row(f"  Gyro   X:{imu['gyro_x']:+7.4f}d/s Y:{imu['gyro_y']:+7.4f}d/s Z:{imu['gyro_z']:+7.4f}d/s")
+        row(" [ PROCESSING: Embedded C Flight Controller (.dll) ]")
+        row("  Complementary Filter (alpha=0.96) + atan2 attitude:")
+        row(f"  Roll  : {roll:+8.4f} deg   [{_bar(roll,  -30, 30)}]")
+        row(f"  Pitch : {pitch:+8.4f} deg   [{_bar(pitch, -30, 30)}]")
         print(div)
-        row(" [ Attitude -- Complementary Filter ]")
-        row(f"  Roll  : {roll:+8.4f} deg   [{_bar(roll,  -30, 30):20s}]")
-        row(f"  Pitch : {pitch:+8.4f} deg   [{_bar(pitch, -30, 30):20s}]")
-        print(div)
-        row(" [ Motor PWM Outputs (us) ]")
-        row(f"  M1 FL: {pwm[0]:4d} [{_pwm_bar(pwm[0])}]   M2 FR: {pwm[1]:4d} [{_pwm_bar(pwm[1])}]")
-        row(f"  M3 RL: {pwm[2]:4d} [{_pwm_bar(pwm[2])}]   M4 RR: {pwm[3]:4d} [{_pwm_bar(pwm[3])}]")
+        row(" [ OUTPUT: Motor PWM Commands (from C motor_mixing) ]")
+        row(f"  M1 FL: {pwm[0]:4d}us [{_pwm_bar(pwm[0])}]   M2 FR: {pwm[1]:4d}us [{_pwm_bar(pwm[1])}]")
+        row(f"  M3 RL: {pwm[2]:4d}us [{_pwm_bar(pwm[2])}]   M4 RR: {pwm[3]:4d}us [{_pwm_bar(pwm[3])}]")
         print(div)
         row(" [ Battery -- 3S LiPo ]")
-        row(f"  {bat['voltage']:5.3f}V  [{batt_bar}]  {bat['percent']:5.1f}%  {batt_warn}")
+        row(f"  {bat['voltage']:5.3f}V  [{_bar(bat['voltage'], 10.5, 12.6)}]  {bat['percent']:5.1f}%  {batt_warn}")
         print(div)
-        print("  Press Ctrl+C to exit SITL simulation.")
+        print("  Press Ctrl+C to exit.")
 
         time.sleep(0.1)
 
@@ -303,3 +340,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n\n[SITL] Simulation terminated by user.")
+    except FileNotFoundError as e:
+        print(f"\n[SITL ERROR] {e}")
+        sys.exit(1)
